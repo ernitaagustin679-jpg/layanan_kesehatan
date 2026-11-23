@@ -1,0 +1,15 @@
+# Dependencies
+**/node_modules/
+
+# Local environment files and secrets
+**/.env
+**/.env.*
+!**/.env.example
+
+# Generated build output
+**/dist/
+**/build/
+**/coverage/
+
+# Package manager logs
+npm-debug.log*
