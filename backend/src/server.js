@@ -5,6 +5,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { z } from 'zod';
 import pool from './db.js';
+import { migrateDatabase } from './migrate.js';
 import { requireAdmin } from './auth.js';
 
 const app = express();
@@ -40,6 +41,28 @@ const exceptionSchema = z.object({
   closes_at: z.string().regex(/^\d{2}:\d{2}$/).nullable(),
   is_closed: z.boolean(),
   note: z.string().trim().max(255).nullable().optional()
+});
+const userCreateSchema = z.object({
+  full_name: z.string().trim().min(2).max(100),
+  email: z.string().trim().email().max(100).toLowerCase(),
+  password: z.string().min(12).max(128),
+  role: z.enum(['admin', 'masyarakat'])
+});
+const userUpdateSchema = userCreateSchema.omit({ password: true }).extend({
+  password: z.string().min(12).max(128).optional()
+});
+const contentSchema = z.object({
+  content_type: z.enum(['informasi', 'artikel']),
+  title: z.string().trim().min(3).max(150),
+  summary: z.string().trim().min(3).max(500),
+  body: z.string().trim().min(10).max(15000),
+  is_published: z.boolean()
+});
+const siteSettingsSchema = z.object({
+  website_name: z.string().trim().min(2).max(100),
+  tagline: z.string().trim().min(2).max(160),
+  homepage_description: z.string().trim().min(10).max(500),
+  whatsapp_number: z.string().trim().regex(/^[+()\d\s-]{7,20}$/)
 });
 
 app.use(cors({ origin: process.env.FRONTEND_ORIGIN || 'http://localhost:5173' }));
@@ -123,6 +146,52 @@ app.post('/api/auth/login', async (req, res, next) => {
   }
 });
 
+app.get('/api/site-settings', async (_req, res, next) => {
+  try {
+    const [rows] = await pool.execute(
+      'SELECT website_name, tagline, homepage_description, whatsapp_number FROM site_settings WHERE settings_id = 1'
+    );
+    if (!rows.length) throw new Error('Pengaturan situs belum tersedia. Jalankan migrasi database.');
+    res.json(rows[0]);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/content', async (req, res, next) => {
+  try {
+    const requestedType = req.query.type;
+    if (requestedType && !['informasi', 'artikel'].includes(requestedType)) {
+      return res.status(400).json({ message: 'Jenis konten tidak valid.' });
+    }
+    const params = requestedType ? [requestedType] : [];
+    const filter = requestedType ? ' AND content_type = ?' : '';
+    const [rows] = await pool.execute(
+      `SELECT content_id, content_type, title, summary, body, is_published, updated_at
+       FROM health_contents WHERE is_published = 1${filter}
+       ORDER BY updated_at DESC, content_id DESC`,
+      params
+    );
+    res.json(rows);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/services', async (_req, res, next) => {
+  try {
+    const [rows] = await pool.execute(
+      `SELECT fs.service_name, COUNT(DISTINCT f.facility_id) AS facility_count
+       FROM facility_services fs
+       JOIN health_facilities f ON f.facility_id = fs.facility_id AND f.status = 'Aktif'
+       GROUP BY fs.service_name ORDER BY fs.service_name`
+    );
+    res.json(rows);
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get('/api/facilities', async (req, res, next) => {
   try {
     const conditions = [];
@@ -151,6 +220,212 @@ app.get('/api/facilities', async (req, res, next) => {
       params
     );
     res.json(rows);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/admin/users', requireAdmin, async (_req, res, next) => {
+  try {
+    const [rows] = await pool.execute(
+      'SELECT user_id, full_name, email, role, created_at FROM users ORDER BY full_name, user_id'
+    );
+    res.json(rows);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/admin/users', requireAdmin, async (req, res, next) => {
+  try {
+    const body = parseOrThrow(userCreateSchema, req.body);
+    const passwordHash = await bcrypt.hash(body.password, 12);
+    const [result] = await pool.execute(
+      'INSERT INTO users (full_name, email, password_hash, role) VALUES (?, ?, ?, ?)',
+      [body.full_name, body.email, passwordHash, body.role]
+    );
+    const [rows] = await pool.execute(
+      'SELECT user_id, full_name, email, role, created_at FROM users WHERE user_id = ?',
+      [result.insertId]
+    );
+    res.status(201).json(rows[0]);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put('/api/admin/users/:id', requireAdmin, async (req, res, next) => {
+  const userId = Number(req.params.id);
+  if (!Number.isInteger(userId) || userId < 1) return res.status(400).json({ message: 'ID pengguna tidak valid.' });
+  const connection = await pool.getConnection();
+  let transactionStarted = false;
+  try {
+    const body = parseOrThrow(userUpdateSchema, req.body);
+    await connection.beginTransaction();
+    transactionStarted = true;
+    await connection.execute('SELECT settings_id FROM site_settings WHERE settings_id = 1 FOR UPDATE');
+    const [users] = await connection.execute(
+      'SELECT user_id, role FROM users WHERE user_id = ? FOR UPDATE',
+      [userId]
+    );
+    if (!users.length) {
+      await connection.rollback();
+      transactionStarted = false;
+      return res.status(404).json({ message: 'Pengguna tidak ditemukan.' });
+    }
+    if (userId === Number(req.admin.sub) && body.role !== 'admin') {
+      await connection.rollback();
+      transactionStarted = false;
+      return res.status(400).json({ message: 'Anda tidak dapat mengubah peran akun sendiri.' });
+    }
+    if (users[0].role === 'admin' && body.role !== 'admin') {
+      const [admins] = await connection.execute("SELECT COUNT(*) AS count FROM users WHERE role = 'admin'");
+      if (admins[0].count <= 1) {
+        await connection.rollback();
+        transactionStarted = false;
+        return res.status(409).json({ message: 'Setidaknya satu akun admin harus tetap tersedia.' });
+      }
+    }
+    const passwordHash = body.password ? await bcrypt.hash(body.password, 12) : null;
+    if (passwordHash) {
+      await connection.execute(
+        'UPDATE users SET full_name = ?, email = ?, role = ?, password_hash = ? WHERE user_id = ?',
+        [body.full_name, body.email, body.role, passwordHash, userId]
+      );
+    } else {
+      await connection.execute(
+        'UPDATE users SET full_name = ?, email = ?, role = ? WHERE user_id = ?',
+        [body.full_name, body.email, body.role, userId]
+      );
+    }
+    const [rows] = await connection.execute(
+      'SELECT user_id, full_name, email, role, created_at FROM users WHERE user_id = ?',
+      [userId]
+    );
+    await connection.commit();
+    transactionStarted = false;
+    res.json(rows[0]);
+  } catch (error) {
+    if (transactionStarted) await connection.rollback();
+    next(error);
+  } finally {
+    connection.release();
+  }
+});
+
+app.delete('/api/admin/users/:id', requireAdmin, async (req, res, next) => {
+  const userId = Number(req.params.id);
+  if (!Number.isInteger(userId) || userId < 1) return res.status(400).json({ message: 'ID pengguna tidak valid.' });
+  if (userId === Number(req.admin.sub)) return res.status(400).json({ message: 'Anda tidak dapat menghapus akun sendiri.' });
+  const connection = await pool.getConnection();
+  let transactionStarted = false;
+  try {
+    await connection.beginTransaction();
+    transactionStarted = true;
+    await connection.execute('SELECT settings_id FROM site_settings WHERE settings_id = 1 FOR UPDATE');
+    const [users] = await connection.execute(
+      'SELECT user_id, role FROM users WHERE user_id = ? FOR UPDATE',
+      [userId]
+    );
+    if (!users.length) {
+      await connection.rollback();
+      transactionStarted = false;
+      return res.status(404).json({ message: 'Pengguna tidak ditemukan.' });
+    }
+    if (users[0].role === 'admin') {
+      const [admins] = await connection.execute("SELECT COUNT(*) AS count FROM users WHERE role = 'admin'");
+      if (admins[0].count <= 1) {
+        await connection.rollback();
+        transactionStarted = false;
+        return res.status(409).json({ message: 'Setidaknya satu akun admin harus tetap tersedia.' });
+      }
+    }
+    await connection.execute('DELETE FROM users WHERE user_id = ?', [userId]);
+    await connection.commit();
+    transactionStarted = false;
+    res.status(204).end();
+  } catch (error) {
+    if (transactionStarted) await connection.rollback();
+    next(error);
+  } finally {
+    connection.release();
+  }
+});
+
+app.put('/api/admin/site-settings', requireAdmin, async (req, res, next) => {
+  try {
+    const body = parseOrThrow(siteSettingsSchema, req.body);
+    await pool.execute(
+      `UPDATE site_settings SET website_name = ?, tagline = ?, homepage_description = ?,
+       whatsapp_number = ? WHERE settings_id = 1`,
+      [body.website_name, body.tagline, body.homepage_description, body.whatsapp_number]
+    );
+    res.json(body);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/admin/content', requireAdmin, async (_req, res, next) => {
+  try {
+    const [rows] = await pool.execute(
+      `SELECT content_id, content_type, title, summary, body, is_published, updated_at
+       FROM health_contents ORDER BY content_type, updated_at DESC, content_id DESC`
+    );
+    res.json(rows);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/admin/content', requireAdmin, async (req, res, next) => {
+  try {
+    const body = parseOrThrow(contentSchema, req.body);
+    const [result] = await pool.execute(
+      `INSERT INTO health_contents (content_type, title, summary, body, is_published)
+       VALUES (?, ?, ?, ?, ?)`,
+      [body.content_type, body.title, body.summary, body.body, body.is_published]
+    );
+    const [rows] = await pool.execute(
+      `SELECT content_id, content_type, title, summary, body, is_published, updated_at
+       FROM health_contents WHERE content_id = ?`,
+      [result.insertId]
+    );
+    res.status(201).json(rows[0]);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put('/api/admin/content/:id', requireAdmin, async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id < 1) return res.status(400).json({ message: 'ID konten tidak valid.' });
+    const body = parseOrThrow(contentSchema, req.body);
+    const [result] = await pool.execute(
+      `UPDATE health_contents SET content_type = ?, title = ?, summary = ?, body = ?, is_published = ?
+       WHERE content_id = ?`,
+      [body.content_type, body.title, body.summary, body.body, body.is_published, id]
+    );
+    if (!result.affectedRows) return res.status(404).json({ message: 'Konten tidak ditemukan.' });
+    const [rows] = await pool.execute(
+      `SELECT content_id, content_type, title, summary, body, is_published, updated_at
+       FROM health_contents WHERE content_id = ?`,
+      [id]
+    );
+    res.json(rows[0]);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.delete('/api/admin/content/:id', requireAdmin, async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id < 1) return res.status(400).json({ message: 'ID konten tidak valid.' });
+    const [result] = await pool.execute('DELETE FROM health_contents WHERE content_id = ?', [id]);
+    if (!result.affectedRows) return res.status(404).json({ message: 'Konten tidak ditemukan.' });
+    res.status(204).end();
   } catch (error) {
     next(error);
   }
@@ -324,9 +599,17 @@ app.use((error, _req, res, _next) => {
   });
 });
 
-if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
-  console.error('JWT_SECRET belum disetel atau kurang dari 32 karakter. Periksa file .env.');
-  process.exit(1);
+async function startServer() {
+  if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
+    throw new Error('JWT_SECRET belum disetel atau kurang dari 32 karakter. Periksa file .env.');
+  }
+  await migrateDatabase();
+  await pool.query('SELECT 1');
+  app.listen(port, () => console.log(`API berjalan di http://localhost:${port}`));
 }
 
-app.listen(port, () => console.log(`API berjalan di http://localhost:${port}`));
+startServer().catch(async (error) => {
+  console.error('Backend gagal terhubung atau menyiapkan database:', error.message);
+  await pool.end();
+  process.exitCode = 1;
+});

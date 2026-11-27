@@ -1,17 +1,27 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { CircleMarker, MapContainer, TileLayer, Tooltip } from 'react-leaflet';
 import {
-  ArrowUpRight, Clock3, Cross, LogOut, MapPin, Search, ShieldCheck,
-  Stethoscope, X
+  ArrowUpRight, BookOpen, Clock3, Cross, FileText, LogOut, MapPin, Phone,
+  Search, Settings, ShieldCheck, Stethoscope, UserRound, X
 } from 'lucide-react';
 import { api } from './api.js';
 
 const weekdays = ['Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu', 'Minggu'];
 const facilityStatuses = ['Aktif', 'Tidak Aktif', 'Perlu Verifikasi'];
+const defaultSiteSettings = {
+  website_name: 'SehatDekat',
+  tagline: 'Layanan kesehatan lebih dekat',
+  homepage_description: 'Temukan fasilitas kesehatan, layanan, informasi, dan artikel kesehatan di sekitar Anda.',
+  whatsapp_number: '081373418699'
+};
 const emptyFacility = {
   facility_name: '', facility_type: 'Puskesmas', address: '', phone_number: '',
   status: 'Perlu Verifikasi', latitude: '', longitude: ''
 };
+const emptyContent = {
+  content_type: 'informasi', title: '', summary: '', body: '', is_published: true
+};
+const emptyUser = { full_name: '', email: '', password: '', role: 'masyarakat' };
 
 function getTodayHours(hours = [], exceptions = []) {
   const day = new Date().getDay();
@@ -31,17 +41,30 @@ function statusStyle(status) {
   return 'badge badge-amber';
 }
 
+function getWhatsAppHref(number) {
+  const digits = number.replace(/\D/g, '');
+  const international = digits.startsWith('0') ? `62${digits.slice(1)}` : digits;
+  return `https://wa.me/${international}?text=${encodeURIComponent('Halo, saya ingin bertanya tentang informasi layanan kesehatan.')}`;
+}
+
 function App() {
   const [page, setPage] = useState('public');
+  const [adminTab, setAdminTab] = useState('facilities');
   const [facilities, setFacilities] = useState([]);
+  const [healthServices, setHealthServices] = useState([]);
+  const [publicContents, setPublicContents] = useState([]);
+  const [siteSettings, setSiteSettings] = useState(defaultSiteSettings);
+  const [activeContent, setActiveContent] = useState(null);
   const [selectedId, setSelectedId] = useState(null);
   const [selected, setSelected] = useState(null);
   const [search, setSearch] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
   const [type, setType] = useState('');
   const [status, setStatus] = useState('');
   const [service, setService] = useState('');
   const [facilityTypes, setFacilityTypes] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [hasLoadedFacilities, setHasLoadedFacilities] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [token, setToken] = useState(() => localStorage.getItem('admin-token') || '');
@@ -55,50 +78,99 @@ function App() {
   const [exceptionForm, setExceptionForm] = useState({
     exception_date: '', is_closed: true, opens_at: '08:00', closes_at: '12:00', note: ''
   });
+  const [adminContents, setAdminContents] = useState([]);
+  const [contentForm, setContentForm] = useState(emptyContent);
+  const [editingContentId, setEditingContentId] = useState(null);
+  const [users, setUsers] = useState([]);
+  const [userForm, setUserForm] = useState(emptyUser);
+  const [editingUserId, setEditingUserId] = useState(null);
+  const [adminSettings, setAdminSettings] = useState(defaultSiteSettings);
+  const facilitiesRequest = useRef(null);
+  const selectedRequest = useRef(null);
 
   const filters = useMemo(() => {
     const params = new URLSearchParams();
-    if (search.trim()) params.set('q', search.trim());
+    if (debouncedSearch.trim()) params.set('q', debouncedSearch.trim());
     if (type) params.set('type', type);
     if (status) params.set('status', status);
     if (service.trim()) params.set('service', service.trim());
     return params.toString();
-  }, [search, type, status, service]);
+  }, [debouncedSearch, type, status, service]);
 
   const loadFacilities = useCallback(async () => {
+    facilitiesRequest.current?.abort();
+    const controller = new AbortController();
+    facilitiesRequest.current = controller;
     setLoading(true);
     setError('');
     try {
-      const data = await api(`/facilities${filters ? `?${filters}` : ''}`);
+      const data = await api(`/facilities${filters ? `?${filters}` : ''}`, { signal: controller.signal });
+      if (controller.signal.aborted) return;
       setFacilities(data);
+      if (!filters) setFacilityTypes([...new Set(data.map((item) => item.facility_type))]);
       setSelectedId((current) => data.some((item) => item.facility_id === current)
         ? current : data[0]?.facility_id || null);
     } catch (err) {
-      setError(err.message);
+      if (err.name !== 'AbortError') setError(err.message);
     } finally {
-      setLoading(false);
+      if (!controller.signal.aborted) {
+        setLoading(false);
+        setHasLoadedFacilities(true);
+      }
     }
   }, [filters]);
 
   const loadSelected = useCallback(async (id) => {
+    selectedRequest.current?.abort();
     if (!id) {
       setSelected(null);
       return;
     }
+    const controller = new AbortController();
+    selectedRequest.current = controller;
     try {
-      setSelected(await api(`/facilities/${id}`));
+      const data = await api(`/facilities/${id}`, { signal: controller.signal });
+      if (!controller.signal.aborted) setSelected(data);
     } catch (err) {
-      setError(err.message);
+      if (err.name !== 'AbortError') setError(err.message);
     }
   }, []);
 
-  useEffect(() => { loadFacilities(); }, [loadFacilities]);
-  useEffect(() => { loadSelected(selectedId); }, [selectedId, loadSelected]);
   useEffect(() => {
-    api('/facilities')
-      .then((data) => setFacilityTypes([...new Set(data.map((item) => item.facility_type))]))
+    const timeout = window.setTimeout(() => setDebouncedSearch(search), 250);
+    return () => window.clearTimeout(timeout);
+  }, [search]);
+  useEffect(() => {
+    loadFacilities();
+    return () => facilitiesRequest.current?.abort();
+  }, [loadFacilities]);
+  useEffect(() => {
+    loadSelected(selectedId);
+    return () => selectedRequest.current?.abort();
+  }, [selectedId, loadSelected]);
+  useEffect(() => {
+    Promise.all([api('/services'), api('/content'), api('/site-settings')])
+      .then(([serviceRows, contentRows, settings]) => {
+        setHealthServices(serviceRows);
+        setPublicContents(contentRows);
+        setSiteSettings(settings);
+        setAdminSettings(settings);
+      })
       .catch((err) => setError(err.message));
   }, []);
+  useEffect(() => {
+    if (page !== 'admin' || !token) return;
+    if (adminTab === 'users') {
+      api('/admin/users', { token }).then(setUsers).catch((err) => setError(err.message));
+    } else if (adminTab === 'content') {
+      api('/admin/content', { token }).then(setAdminContents).catch((err) => setError(err.message));
+    } else if (adminTab === 'settings') {
+      api('/site-settings').then((settings) => {
+        setAdminSettings(settings);
+        setSiteSettings(settings);
+      }).catch((err) => setError(err.message));
+    }
+  }, [adminTab, page, token]);
 
   function showMessage(message) {
     setNotice(message);
@@ -114,6 +186,7 @@ function App() {
       setToken(result.token);
       setLogin({ email: '', password: '' });
       setPage('admin');
+      setAdminTab('facilities');
       showMessage(`Selamat datang, ${result.user.name}.`);
     } catch (err) {
       setError(err.message);
@@ -125,6 +198,7 @@ function App() {
     setEditingId(null);
     setServicesText('');
     setSchedule(weekdays.map((_, i) => ({ day_of_week: i + 1, slots: [] })));
+    setAdminTab('facilities');
     setPage('admin');
   }
 
@@ -204,6 +278,7 @@ function App() {
         method: 'PUT', token, body: JSON.stringify(hours)
       });
       await loadFacilities();
+      setHealthServices(await api('/services'));
       setSelectedId(saved.facility_id);
       await loadSelected(saved.facility_id);
       showMessage(editingId ? 'Informasi fasilitas diperbarui.' : 'Fasilitas baru ditambahkan.');
@@ -217,6 +292,7 @@ function App() {
     try {
       await api(`/admin/facilities/${facility.facility_id}`, { method: 'DELETE', token });
       await loadFacilities();
+      setHealthServices(await api('/services'));
       setSelected(null);
       showMessage('Fasilitas berhasil dihapus.');
     } catch (err) {
@@ -256,10 +332,125 @@ function App() {
     }
   }
 
+  function startCreateContent() {
+    setContentForm(emptyContent);
+    setEditingContentId(null);
+  }
+
+  function startEditContent(content) {
+    setContentForm({
+      content_type: content.content_type,
+      title: content.title,
+      summary: content.summary,
+      body: content.body,
+      is_published: Boolean(content.is_published)
+    });
+    setEditingContentId(content.content_id);
+  }
+
+  async function saveContent(event) {
+    event.preventDefault();
+    setError('');
+    try {
+      const saved = await api(editingContentId
+        ? `/admin/content/${editingContentId}` : '/admin/content', {
+        method: editingContentId ? 'PUT' : 'POST',
+        token,
+        body: JSON.stringify(contentForm)
+      });
+      setAdminContents(await api('/admin/content', { token }));
+      setPublicContents(await api('/content'));
+      startEditContent(saved);
+      showMessage(editingContentId ? 'Konten berhasil diperbarui.' : 'Konten baru berhasil ditambahkan.');
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function removeContent(content) {
+    if (!content) return;
+    if (!window.confirm(`Hapus konten "${content.title}"?`)) return;
+    try {
+      await api(`/admin/content/${content.content_id}`, { method: 'DELETE', token });
+      setAdminContents(await api('/admin/content', { token }));
+      setPublicContents(await api('/content'));
+      startCreateContent();
+      showMessage('Konten berhasil dihapus.');
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  function startCreateUser() {
+    setUserForm(emptyUser);
+    setEditingUserId(null);
+  }
+
+  function startEditUser(user) {
+    setUserForm({
+      full_name: user.full_name,
+      email: user.email,
+      password: '',
+      role: user.role
+    });
+    setEditingUserId(user.user_id);
+  }
+
+  async function saveUser(event) {
+    event.preventDefault();
+    setError('');
+    try {
+      const payload = { ...userForm };
+      if (editingUserId && !payload.password) delete payload.password;
+      const saved = await api(editingUserId
+        ? `/admin/users/${editingUserId}` : '/admin/users', {
+        method: editingUserId ? 'PUT' : 'POST',
+        token,
+        body: JSON.stringify(payload)
+      });
+      setUsers(await api('/admin/users', { token }));
+      startEditUser(saved);
+      showMessage(editingUserId ? 'Pengguna berhasil diperbarui.' : 'Pengguna baru berhasil ditambahkan.');
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function removeUser(user) {
+    if (!user) return;
+    if (!window.confirm(`Hapus akun ${user.full_name} (${user.email})?`)) return;
+    try {
+      await api(`/admin/users/${user.user_id}`, { method: 'DELETE', token });
+      setUsers(await api('/admin/users', { token }));
+      if (editingUserId === user.user_id) startCreateUser();
+      showMessage('Akun pengguna berhasil dihapus.');
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function saveSiteSettings(event) {
+    event.preventDefault();
+    setError('');
+    try {
+      const saved = await api('/admin/site-settings', {
+        method: 'PUT',
+        token,
+        body: JSON.stringify(adminSettings)
+      });
+      setAdminSettings(saved);
+      setSiteSettings(saved);
+      showMessage('Pengaturan website berhasil disimpan.');
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
   function signOut() {
     localStorage.removeItem('admin-token');
     setToken('');
     setPage('public');
+    setAdminTab('facilities');
     showMessage('Anda telah keluar dari sesi admin.');
   }
 
@@ -277,10 +468,16 @@ function App() {
         <div className="container header-inner">
           <a className="brand" href="#" onClick={(event) => { event.preventDefault(); setPage('public'); }}>
             <span className="brand-mark"><Cross size={23} strokeWidth={3} /></span>
-            <span>Sehat<span className="brand-light">Dekat</span></span>
+            <span>{siteSettings.website_name}</span>
           </a>
+          {page === 'public' && <nav className="site-nav" aria-label="Navigasi beranda">
+            <a href="#cari">Fasilitas</a>
+            <a href="#layanan">Layanan</a>
+            <a href="#informasi">Informasi</a>
+            <a href="#artikel">Artikel</a>
+          </nav>}
           <div className="header-actions">
-            <span className="header-caption"><span className="live-dot" /> INFO LAYANAN KESEHATAN</span>
+            <span className="header-caption"><span className="live-dot" /> {siteSettings.tagline.toUpperCase()}</span>
             {token ? (
               <div className="header-actions">
                 <button className="button button-outline" onClick={() => setPage('admin')}><ShieldCheck size={17} /> Dashboard</button>
@@ -313,10 +510,18 @@ function App() {
           <section className="container admin-layout">
             <div className="admin-heading">
               <div><span className="eyebrow">PANEL PENGELOLAAN</span><h1>Kelola informasi<span className="text-blue">.</span></h1></div>
-              <button className="button button-primary" onClick={startCreate}><Cross size={17} /> Tambah fasilitas</button>
+              {adminTab === 'facilities' && <button className="button button-primary" onClick={startCreate}><Cross size={17} /> Tambah fasilitas</button>}
+              {adminTab === 'content' && <button className="button button-primary" onClick={startCreateContent}><FileText size={17} /> Tambah konten</button>}
+              {adminTab === 'users' && <button className="button button-primary" onClick={startCreateUser}><UserRound size={17} /> Tambah pengguna</button>}
             </div>
             {error && <div className="alert">{error}</div>}
-            <div className="admin-grid">
+            <nav className="admin-tabs" aria-label="Menu dashboard">
+              <button className={adminTab === 'facilities' ? 'active' : ''} onClick={() => setAdminTab('facilities')}><Stethoscope size={17} /> Fasilitas</button>
+              <button className={adminTab === 'content' ? 'active' : ''} onClick={() => setAdminTab('content')}><FileText size={17} /> Konten kesehatan</button>
+              <button className={adminTab === 'users' ? 'active' : ''} onClick={() => setAdminTab('users')}><UserRound size={17} /> Pengguna</button>
+              <button className={adminTab === 'settings' ? 'active' : ''} onClick={() => setAdminTab('settings')}><Settings size={17} /> Pengaturan website</button>
+            </nav>
+            {adminTab === 'facilities' && <div className="admin-grid">
               <aside className="admin-list card">
                 <h2>Fasilitas tersimpan <span className="count-pill">{facilities.length}</span></h2>
                 {facilities.map((facility) => (
@@ -375,7 +580,68 @@ function App() {
                   </div>
                 )}
               </div>
-            </div>
+            </div>}
+            {adminTab === 'content' && <div className="admin-grid">
+              <aside className="admin-list card">
+                <h2>Konten tersimpan <span className="count-pill">{adminContents.length}</span></h2>
+                {adminContents.map((content) => (
+                  <button key={content.content_id} className={`admin-row ${editingContentId === content.content_id ? 'active' : ''}`} onClick={() => startEditContent(content)}>
+                    <span><b>{content.title}</b><small>{content.content_type} · {content.is_published ? 'Terbit' : 'Draf'}</small></span><ArrowUpRight size={16} />
+                  </button>
+                ))}
+                {!adminContents.length && <p className="muted">Belum ada konten.</p>}
+              </aside>
+              <form className="card admin-form-card" onSubmit={saveContent}>
+                <div className="form-heading">
+                  <div><span className="eyebrow">{editingContentId ? 'EDIT KONTEN' : 'KONTEN BARU'}</span><h2>{editingContentId ? 'Perbarui konten' : 'Tambah konten kesehatan'}</h2></div>
+                  {editingContentId && <button type="button" className="button button-danger" onClick={() => removeContent(adminContents.find((item) => item.content_id === editingContentId))}>Hapus</button>}
+                </div>
+                <div className="form-grid">
+                  <label>Jenis konten<select value={contentForm.content_type} onChange={(event) => setContentForm({ ...contentForm, content_type: event.target.value })}><option value="informasi">Informasi kesehatan</option><option value="artikel">Artikel kesehatan</option></select></label>
+                  <label>Status publikasi<select value={contentForm.is_published ? 'published' : 'draft'} onChange={(event) => setContentForm({ ...contentForm, is_published: event.target.value === 'published' })}><option value="published">Terbit</option><option value="draft">Draf</option></select></label>
+                  <label className="wide">Judul<input required maxLength="150" value={contentForm.title} onChange={(event) => setContentForm({ ...contentForm, title: event.target.value })} /></label>
+                  <label className="wide">Ringkasan<textarea required rows="2" maxLength="500" value={contentForm.summary} onChange={(event) => setContentForm({ ...contentForm, summary: event.target.value })} /></label>
+                  <label className="wide">Isi konten<textarea required rows="8" maxLength="15000" value={contentForm.body} onChange={(event) => setContentForm({ ...contentForm, body: event.target.value })} /></label>
+                </div>
+                <button className="button button-primary save-button">Simpan konten <ArrowUpRight size={18} /></button>
+                <p className="muted">Gunakan informasi yang telah diperiksa. Konten kesehatan bukan pengganti konsultasi tenaga kesehatan.</p>
+              </form>
+            </div>}
+            {adminTab === 'users' && <div className="admin-grid">
+              <aside className="admin-list card">
+                <h2>Pengguna terdaftar <span className="count-pill">{users.length}</span></h2>
+                {users.map((user) => (
+                  <button key={user.user_id} className={`admin-row ${editingUserId === user.user_id ? 'active' : ''}`} onClick={() => startEditUser(user)}>
+                    <span><b>{user.full_name}</b><small>{user.email} · {user.role}</small></span><ArrowUpRight size={16} />
+                  </button>
+                ))}
+                {!users.length && <p className="muted">Belum ada pengguna.</p>}
+              </aside>
+              <form className="card admin-form-card" onSubmit={saveUser}>
+                <div className="form-heading">
+                  <div><span className="eyebrow">{editingUserId ? 'EDIT AKUN' : 'AKUN BARU'}</span><h2>{editingUserId ? 'Perbarui pengguna' : 'Tambah pengguna'}</h2></div>
+                  {editingUserId && <button type="button" className="button button-danger" onClick={() => removeUser(users.find((item) => item.user_id === editingUserId))}>Hapus</button>}
+                </div>
+                <div className="form-grid">
+                  <label className="wide">Nama lengkap<input required minLength="2" maxLength="100" value={userForm.full_name} onChange={(event) => setUserForm({ ...userForm, full_name: event.target.value })} /></label>
+                  <label className="wide">Email<input required type="email" maxLength="100" value={userForm.email} onChange={(event) => setUserForm({ ...userForm, email: event.target.value })} /></label>
+                  <label>Peran<select value={userForm.role} onChange={(event) => setUserForm({ ...userForm, role: event.target.value })}><option value="masyarakat">Masyarakat</option><option value="admin">Admin</option></select></label>
+                  <label>Kata sandi<input type="password" autoComplete="new-password" minLength="12" maxLength="128" required={!editingUserId} value={userForm.password} onChange={(event) => setUserForm({ ...userForm, password: event.target.value })} placeholder={editingUserId ? 'Kosongkan jika tidak diubah' : 'Minimal 12 karakter'} /></label>
+                </div>
+                <button className="button button-primary save-button">Simpan pengguna <ArrowUpRight size={18} /></button>
+                <p className="muted">Setidaknya satu akun admin harus tetap tersedia. Kata sandi disimpan dalam bentuk hash.</p>
+              </form>
+            </div>}
+            {adminTab === 'settings' && <form className="card admin-form-card settings-form" onSubmit={saveSiteSettings}>
+              <div className="form-heading"><div><span className="eyebrow">IDENTITAS SITUS</span><h2>Pengaturan website</h2></div></div>
+              <div className="form-grid">
+                <label>Nama website<input required maxLength="100" value={adminSettings.website_name} onChange={(event) => setAdminSettings({ ...adminSettings, website_name: event.target.value })} /></label>
+                <label>Tagline<input required maxLength="160" value={adminSettings.tagline} onChange={(event) => setAdminSettings({ ...adminSettings, tagline: event.target.value })} /></label>
+                <label className="wide">Deskripsi beranda<textarea required rows="3" maxLength="500" value={adminSettings.homepage_description} onChange={(event) => setAdminSettings({ ...adminSettings, homepage_description: event.target.value })} /></label>
+                <label>Nomor WhatsApp<input required maxLength="20" value={adminSettings.whatsapp_number} onChange={(event) => setAdminSettings({ ...adminSettings, whatsapp_number: event.target.value })} /></label>
+              </div>
+              <button className="button button-primary save-button"><Settings size={17} /> Simpan pengaturan</button>
+            </form>}
           </section>
         ) : (
           <>
@@ -384,8 +650,11 @@ function App() {
                 <div className="hero-copy">
                   <span className="eyebrow"><span className="live-dot" /> INFORMASI FASILITAS KESEHATAN</span>
                   <h1>Layanan sehat,<br /><span>lebih dekat.</span></h1>
-                  <p>Temukan fasilitas kesehatan, cek layanan, jam operasional, dan lokasi sebelum berangkat.</p>
-                  <a className="button button-dark hero-cta" href="#cari">Cari fasilitas <ArrowUpRight size={19} /></a>
+                  <p>{siteSettings.homepage_description}</p>
+                  <div className="hero-actions">
+                    <a className="button button-dark hero-cta" href="#cari">Cari fasilitas <ArrowUpRight size={19} /></a>
+                    <a className="button button-outline hero-cta" href={getWhatsAppHref(siteSettings.whatsapp_number)} target="_blank" rel="noreferrer"><Phone size={17} /> WhatsApp {siteSettings.whatsapp_number}</a>
+                  </div>
                 </div>
                 <div className="hero-art" aria-hidden="true">
                   <div className="art-ring ring-one" /><div className="art-ring ring-two" />
@@ -409,12 +678,15 @@ function App() {
                 <select aria-label="Filter status" value={status} onChange={(e) => setStatus(e.target.value)}><option value="">Semua status</option>{facilityStatuses.map((value) => <option key={value}>{value}</option>)}</select>
                 <input className="service-filter" aria-label="Cari layanan" placeholder="Nama layanan..." value={service} onChange={(e) => setService(e.target.value)} />
               </div>
-              {notice && <div className="toast">{notice}</div>}
               {error && <div className="alert">{error}</div>}
-              {loading ? <div className="empty-state">Memuat informasi fasilitas...</div> : (
-                <div className="results-grid">
+              {!hasLoadedFacilities ? (
+                <div className="empty-state loading-state" role="status"><span className="loading-spinner" /> Memuat informasi fasilitas...</div>
+              ) : (
+                <>
+                {loading && <div className="results-loading" role="status"><span className="loading-spinner" /> Memperbarui hasil...</div>}
+                <div className="results-grid" aria-busy={loading}>
                   <div className="facility-list">
-                    <div className="results-caption"><span>{facilities.length} FASILITAS DITEMUKAN</span><span className="accent-line" /></div>
+                    <div className="results-caption" aria-live="polite"><span>{facilities.length} FASILITAS DITEMUKAN</span><span className="accent-line" /></div>
                     {facilities.map((facility) => (
                       <button key={facility.facility_id} className={`facility-card ${selectedId === facility.facility_id ? 'selected' : ''}`} onClick={() => setSelectedId(facility.facility_id)}>
                         <span className="facility-symbol"><Stethoscope size={21} /></span>
@@ -455,12 +727,86 @@ function App() {
                     ) : <div className="detail-card empty-detail"><MapPin size={28} /><p>Pilih fasilitas untuk melihat detail layanan dan jam operasional.</p></div>}
                   </div>
                 </div>
+                </>
               )}
+            </section>
+            <section className="container content-section health-services-section" id="layanan">
+              <div className="section-intro">
+                <div><span className="eyebrow">JELAJAHI LAYANAN</span><h2>Layanan <span className="text-blue">kesehatan.</span></h2></div>
+                <p>Pilih jenis layanan untuk mencari fasilitas yang menyediakannya.</p>
+              </div>
+              <div className="health-services-grid">
+                {healthServices.map((item) => (
+                  <button className="health-service-card" key={item.service_name} onClick={() => {
+                    setSearch('');
+                    setType('');
+                    setStatus('');
+                    setService(item.service_name);
+                    document.getElementById('cari')?.scrollIntoView({ behavior: 'smooth' });
+                  }}>
+                    <span className="facility-symbol"><Stethoscope size={21} /></span>
+                    <span><b>{item.service_name}</b><small>{item.facility_count} fasilitas aktif</small></span>
+                    <ArrowUpRight size={18} />
+                  </button>
+                ))}
+                {!healthServices.length && <div className="empty-state">Informasi layanan akan tampil setelah data layanan fasilitas tersedia.</div>}
+              </div>
+            </section>
+            <section className="container content-section health-content-section" id="informasi">
+              <div className="section-intro">
+                <div><span className="eyebrow">PANDUAN PENGUNJUNG</span><h2>Informasi <span className="text-blue">kesehatan.</span></h2></div>
+                <p>Informasi umum untuk membantu Anda menggunakan direktori fasilitas.</p>
+              </div>
+              <div className="health-content-grid">
+                {publicContents.filter((item) => item.content_type === 'informasi').map((item) => (
+                  <article className="health-content-card" key={item.content_id}>
+                    <span className="content-card-icon"><FileText size={20} /></span>
+                    <h3>{item.title}</h3>
+                    <p>{item.summary}</p>
+                    <button className="text-button" onClick={() => setActiveContent(item)}>Baca informasi <ArrowUpRight size={15} /></button>
+                  </article>
+                ))}
+                {!publicContents.some((item) => item.content_type === 'informasi') && <div className="empty-state">Informasi kesehatan belum tersedia.</div>}
+              </div>
+            </section>
+            <section className="container content-section health-content-section" id="artikel">
+              <div className="section-intro">
+                <div><span className="eyebrow">BACAAN KESEHATAN</span><h2>Artikel <span className="text-blue">pilihan.</span></h2></div>
+                <p>Baca artikel kesehatan dan informasi layanan yang telah dipublikasikan.</p>
+              </div>
+              <div className="health-content-grid">
+                {publicContents.filter((item) => item.content_type === 'artikel').map((item) => (
+                  <article className="health-content-card" key={item.content_id}>
+                    <span className="content-card-icon"><BookOpen size={20} /></span>
+                    <h3>{item.title}</h3>
+                    <p>{item.summary}</p>
+                    <button className="text-button" onClick={() => setActiveContent(item)}>Baca artikel <ArrowUpRight size={15} /></button>
+                  </article>
+                ))}
+                {!publicContents.some((item) => item.content_type === 'artikel') && <div className="empty-state">Artikel kesehatan belum tersedia.</div>}
+              </div>
+            </section>
+            <section className="container whatsapp-banner">
+              <div><span className="eyebrow">HUBUNGI KAMI</span><h2>Ada yang ingin ditanyakan?</h2><p>Hubungi kami melalui WhatsApp di <b>{siteSettings.whatsapp_number}</b>.</p></div>
+              <a className="button button-primary" href={getWhatsAppHref(siteSettings.whatsapp_number)} target="_blank" rel="noreferrer"><Phone size={17} /> Chat WhatsApp <ArrowUpRight size={17} /></a>
             </section>
           </>
         )}
       </main>
-      <footer className="site-footer"><div className="container"><a className="brand footer-brand" href="#"><span className="brand-mark"><Cross size={18} strokeWidth={3} /></span><span>Sehat<span className="brand-light">Dekat</span></span></a><span>Informasi fasilitas kesehatan dalam satu langkah.</span><span>© {new Date().getFullYear()} SehatDekat</span></div></footer>
+      {notice && <div className="toast">{notice}</div>}
+      {activeContent && <div className="content-modal-backdrop" onMouseDown={(event) => {
+        if (event.target === event.currentTarget) setActiveContent(null);
+      }}>
+        <article className="content-modal" role="dialog" aria-modal="true" aria-labelledby="content-modal-title">
+          <button className="content-modal-close" aria-label="Tutup artikel" onClick={() => setActiveContent(null)}><X size={20} /></button>
+          <span className="eyebrow">{activeContent.content_type === 'artikel' ? 'ARTIKEL KESEHATAN' : 'INFORMASI KESEHATAN'}</span>
+          <h2 id="content-modal-title">{activeContent.title}</h2>
+          <p className="content-modal-summary">{activeContent.summary}</p>
+          <div className="content-modal-body">{activeContent.body}</div>
+          <p className="content-disclaimer">Informasi ini bersifat umum dan bukan pengganti konsultasi tenaga kesehatan.</p>
+        </article>
+      </div>}
+      <footer className="site-footer"><div className="container"><a className="brand footer-brand" href="#"><span className="brand-mark"><Cross size={18} strokeWidth={3} /></span><span>{siteSettings.website_name}</span></a><span>{siteSettings.tagline}</span><span>© {new Date().getFullYear()} {siteSettings.website_name}</span></div></footer>
     </div>
   );
 }

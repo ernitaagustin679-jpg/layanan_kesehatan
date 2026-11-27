@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import bcrypt from 'bcryptjs';
 import pool from '../src/db.js';
+import { migrateDatabase } from '../src/migrate.js';
 
 const { ADMIN_NAME, ADMIN_EMAIL, ADMIN_PASSWORD } = process.env;
 
@@ -9,6 +10,7 @@ if (!ADMIN_NAME || !ADMIN_EMAIL || !ADMIN_PASSWORD || ADMIN_PASSWORD.length < 12
   process.exitCode = 1;
 } else {
   try {
+    await migrateDatabase();
     const [existing] = await pool.execute(
       'SELECT user_id FROM users WHERE email = ? LIMIT 1',
       [ADMIN_EMAIL]
